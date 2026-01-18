@@ -1,0 +1,33 @@
+# Files and directories created by pub
+.dart_tool/
+.packages
+build/
+pubspec.lock
+
+# Conventional directory for build outputs
+dist/
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/
+*.lcov
+
+# Generated files
+*.g.dart
+*.freezed.dart
+*.config.dart
+
+# Flutter/Dart specific
+.flutter-plugins
+.flutter-plugins-dependencies

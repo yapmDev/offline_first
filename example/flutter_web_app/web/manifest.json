@@ -1,0 +1,11 @@
+{
+    "name": "Offline First Demo",
+    "short_name": "Offline First",
+    "start_url": ".",
+    "display": "standalone",
+    "background_color": "#0175C2",
+    "theme_color": "#0175C2",
+    "description": "Demo of offline-first architecture",
+    "orientation": "portrait-primary",
+    "prefer_related_applications": false
+}

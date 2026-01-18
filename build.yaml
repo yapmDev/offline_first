@@ -1,0 +1,17 @@
+targets:
+  $default:
+    builders:
+      offline_first|offline_entity_builder:
+        enabled: true
+        generate_for:
+          - lib/**/*.dart
+          - test/**/*.dart
+          - example/**/*.dart
+
+builders:
+  offline_entity_builder:
+    import: "package:offline_first/generator.dart"
+    builder_factories: ["offlineEntityBuilder"]
+    build_extensions: {".dart": [".offline.g.dart"]}
+    auto_apply: dependents
+    build_to: source
