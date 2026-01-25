@@ -287,9 +287,22 @@ class HttpProductAdapter extends RemoteAdapter<Product> {
 
       if (response.statusCode == 200 || response.statusCode == 201) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
+        
+        // Build complete payload with server data
+        final resolvedPayload = {
+          'id': data['id'],
+          'name': data['name'],
+          'price': data['price'],
+          'stock': data['stock'],
+          'version': data['version'],        // Server-managed field
+          'createdAt': data['createdAt'],    // Server-managed field
+          'updatedAt': data['updatedAt'],    // Server-managed field
+        };
+        
         return SyncResult.success(
           serverId: data['id'] as String?,
           serverTimestamp: data['timestamp'] as int?,
+          resolvedPayload: resolvedPayload,  // Updates local storage
         );
       } else if (response.statusCode == 409) {
         // Conflict
@@ -331,7 +344,21 @@ class HttpProductAdapter extends RemoteAdapter<Product> {
       );
 
       if (response.statusCode == 200) {
-        return SyncResult.success();
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        
+        // Update local entity with new version from server
+        final resolvedPayload = {
+          'id': data['id'],
+          'name': data['name'],
+          'price': data['price'],
+          'stock': data['stock'],
+          'version': data['version'],        // Incremented by server
+          'updatedAt': data['updatedAt'],
+        };
+        
+        return SyncResult.success(
+          resolvedPayload: resolvedPayload,  // Updates local storage
+        );
       } else if (response.statusCode == 409) {
         final conflictData = jsonDecode(response.body) as Map<String, dynamic>;
         return SyncResult.conflict(conflictData: conflictData);
@@ -683,6 +710,347 @@ class GraphQLProductAdapter extends RemoteAdapter<Product> {
   }
 
   // Similar implementations for update, delete...
+}
+```
+
+---
+
+## Optimistic Locking with Version Fields
+
+Optimistic locking prevents concurrent modification conflicts by using a version field. Here's a complete implementation:
+
+### Backend Setup (Example with Spring Boot + MongoDB)
+
+```java
+@Document(collection = "products")
+public class Product {
+    @Id
+    private String id;
+    private String name;
+    private Double price;
+    
+    @Version  // MongoDB handles versioning automatically
+    private Long version;
+    
+    // ... getters/setters
+}
+
+@PutMapping("/{id}")
+public ResponseEntity<ProductResponse> updateProduct(
+    @PathVariable String id,
+    @Valid @RequestBody ProductUpdateRequest request,
+    @RequestHeader(value = "X-Operation-Id", required = false) String operationId
+) {
+    // Check idempotency
+    if (operationId != null && isProcessed(operationId)) {
+        return ResponseEntity.ok(getExistingProduct(id));
+    }
+    
+    Product product = productRepository.findById(id)
+        .orElseThrow(() -> new NotFoundException("Product not found"));
+    
+    // Verify version for optimistic locking
+    if (!product.getVersion().equals(request.getVersion())) {
+        return ResponseEntity.status(409)  // Conflict
+            .body(new ConflictResponse(product));
+    }
+    
+    // Update and save (version auto-increments)
+    product.setName(request.getName());
+    product.setPrice(request.getPrice());
+    Product updated = productRepository.save(product);
+    
+    // Mark operation as processed
+    if (operationId != null) {
+        markAsProcessed(operationId);
+    }
+    
+    return ResponseEntity.ok(toResponse(updated));
+}
+```
+
+### Frontend Model (Hive)
+
+```dart
+@HiveType(typeId: 0)
+class ProductModel {
+  @HiveField(0)
+  final String id;
+  
+  @HiveField(1)
+  final String name;
+  
+  @HiveField(2)
+  final double price;
+  
+  @HiveField(3)
+  final int version;  // Store version locally
+  
+  @HiveField(4)
+  final int schemaVersion;  // For schema migrations
+  
+  const ProductModel({
+    required this.id,
+    required this.name,
+    required this.price,
+    this.version = 0,
+    this.schemaVersion = 1,
+  });
+  
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'price': price,
+    'version': version,
+    'schemaVersion': schemaVersion,
+  };
+  
+  factory ProductModel.fromJson(Map<String, dynamic> json) {
+    return ProductModel(
+      id: json['id'],
+      name: json['name'],
+      price: json['price'],
+      version: json['version'] ?? 0,
+      schemaVersion: json['schemaVersion'] ?? 1,
+    );
+  }
+}
+```
+
+### Remote Adapter with Version Handling
+
+```dart
+@injectable
+class ProductRemoteAdapter implements RemoteAdapter<ProductModel> {
+  final DioClient _dioClient;
+  
+  ProductRemoteAdapter(this._dioClient);
+  
+  @override
+  String get entityType => 'product';
+  
+  @override
+  Future<SyncResult> create(Operation operation) async {
+    try {
+      final response = await _dioClient.dio.post(
+        '/api/products',
+        data: operation.payload,
+        options: Options(
+          headers: {'X-Operation-Id': operation.operationId},
+        ),
+      );
+      
+      if (response.statusCode == 201) {
+        final data = response.data as Map<String, dynamic>;
+        
+        // Build complete payload with server data
+        final resolvedPayload = {
+          'id': data['id'],
+          'name': data['name'],
+          'price': data['price'],
+          'version': data['version'],        // Initial version from server
+          'schemaVersion': data['schemaVersion'],
+          'createdAt': data['createdAt'],
+          'updatedAt': data['updatedAt'],
+        };
+        
+        return SyncResult.success(
+          serverId: data['id'],
+          serverTimestamp: DateTime.parse(data['updatedAt']).millisecondsSinceEpoch,
+          resolvedPayload: resolvedPayload,  // Updates Hive
+        );
+      }
+      
+      return SyncResult.failure(
+        errorMessage: 'Unexpected status: ${response.statusCode}',
+      );
+    } on DioException catch (e) {
+      return _handleDioException(e);
+    }
+  }
+  
+  @override
+  Future<SyncResult> update(Operation operation) async {
+    try {
+      final payload = operation.payload;
+      
+      // Version MUST be in payload (from Hive)
+      final version = payload['version'];
+      if (version == null) {
+        return SyncResult.failure(
+          errorMessage: 'Version is required for update',
+        );
+      }
+      
+      final response = await _dioClient.dio.put(
+        '/api/products/${operation.entityId}',
+        data: {
+          'name': payload['name'],
+          'price': payload['price'],
+          'version': version,  // Send current version
+        },
+        options: Options(
+          headers: {'X-Operation-Id': operation.operationId},
+        ),
+      );
+      
+      if (response.statusCode == 200) {
+        final data = response.data as Map<String, dynamic>;
+        
+        // Update with new version from server
+        final resolvedPayload = {
+          'id': data['id'],
+          'name': data['name'],
+          'price': data['price'],
+          'version': data['version'],        // Incremented by server
+          'schemaVersion': data['schemaVersion'],
+          'updatedAt': data['updatedAt'],
+        };
+        
+        return SyncResult.success(
+          serverTimestamp: DateTime.parse(data['updatedAt']).millisecondsSinceEpoch,
+          resolvedPayload: resolvedPayload,  // Updates Hive with new version
+        );
+      }
+      
+      return SyncResult.failure(
+        errorMessage: 'Unexpected status: ${response.statusCode}',
+      );
+    } on DioException catch (e) {
+      return _handleDioException(e);
+    }
+  }
+  
+  SyncResult _handleDioException(DioException e) {
+    final statusCode = e.response?.statusCode;
+    
+    // Version conflict
+    if (statusCode == 409) {
+      final conflictData = e.response?.data;
+      if (conflictData != null && conflictData is Map<String, dynamic>) {
+        return SyncResult.conflict(
+          conflictData: conflictData['currentState'] ?? conflictData,
+        );
+      }
+      return SyncResult.conflict(conflictData: const {});
+    }
+    
+    // Client errors (4xx) - not retryable
+    if (statusCode != null && statusCode >= 400 && statusCode < 500) {
+      return SyncResult.failure(
+        errorMessage: 'Client error: ${e.message}',
+        isRetryable: false,
+      );
+    }
+    
+    // Server errors (5xx) and network errors - retryable
+    return SyncResult.failure(
+      errorMessage: e.message ?? 'Unknown error',
+      isRetryable: true,
+    );
+  }
+}
+```
+
+### Repository Implementation
+
+```dart
+@LazySingleton(as: ProductRepository)
+class ProductRepositoryImpl implements ProductRepository {
+  final OfflineStore _offlineStore;
+  final Box<ProductModel> _productBox;
+  
+  ProductRepositoryImpl(this._offlineStore, this._productBox);
+  
+  @override
+  Future<void> create(String name, double price) async {
+    final id = const Uuid().v4();
+    final product = ProductModel(
+      id: id,
+      name: name,
+      price: price,
+      version: 0,  // Initial version
+    );
+    
+    // 1. Save to Hive
+    await _productBox.put(id, product);
+    
+    // 2. Log operation
+    await _offlineStore.logCreate('product', id, product.toJson());
+  }
+  
+  @override
+  Future<void> update(Product product) async {
+    final model = ProductModel(
+      id: product.id,
+      name: product.name,
+      price: product.price,
+      version: product.version,  // Current version from Hive
+    );
+    
+    // 1. Update in Hive
+    await _productBox.put(product.id, model);
+    
+    // 2. Log operation (includes current version)
+    await _offlineStore.logUpdate('product', product.id, model.toJson());
+  }
+}
+```
+
+### Complete Flow
+
+```
+1. User creates product offline
+   → ProductModel(version: 0) saved to Hive
+   → Operation logged
+
+2. User syncs
+   → RemoteAdapter.create() sends to server
+   → Server creates with version: 0
+   → RemoteAdapter returns resolvedPayload with version: 0
+   → SyncEngine calls StorageAdapter.saveEntity()
+   → Hive updated with version: 0 ✅
+
+3. User updates product offline
+   → ProductModel(version: 0) updated in Hive
+   → Operation logged with payload including version: 0
+
+4. User syncs
+   → RemoteAdapter.update() sends version: 0
+   → Server validates version, updates, increments to version: 1
+   → RemoteAdapter returns resolvedPayload with version: 1
+   → Hive updated with version: 1 ✅
+
+5. Next update will use version: 1
+   → Optimistic locking works correctly ✅
+```
+
+### Conflict Resolution
+
+If a conflict occurs (409 response), implement a custom resolver:
+
+```dart
+class ProductConflictResolver extends ConflictResolver {
+  @override
+  Future<Resolution> resolve(
+    LocalState local,
+    RemoteState remote,
+    List<Operation> pendingOperations,
+  ) async {
+    // Strategy 1: Always use remote (last-write-wins server-side)
+    return Resolution.useRemote();
+    
+    // Strategy 2: Always use local (retry with new version)
+    // return Resolution.useLocal();
+    
+    // Strategy 3: Merge (custom logic)
+    // final merged = {
+    //   ...remote.data,
+    //   'name': local.data['name'],  // Keep local name
+    //   'version': remote.data['version'],  // Use server version
+    // };
+    // return Resolution.merge(merged);
+  }
 }
 ```
 

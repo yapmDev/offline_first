@@ -21,7 +21,29 @@ class SyncResult {
   /// Optional: Conflict data from server
   final Map<String, dynamic>? conflictData;
 
-  /// Optional: Updated payload from server (after conflict resolution)
+  /// Optional: Updated payload from server
+  ///
+  /// When provided, the SyncEngine will automatically call
+  /// `StorageAdapter.saveEntity()` to update the local entity with server data.
+  ///
+  /// **Use cases:**
+  /// - Optimistic locking: Update version field after server increments it
+  /// - Server-generated fields: timestamps, auto-increment IDs, computed fields
+  /// - Normalized data: Update entity with server's canonical representation
+  ///
+  /// **Example:**
+  /// ```dart
+  /// if (response.statusCode == 200) {
+  ///   final data = response.data;
+  ///   return SyncResult.success(
+  ///     resolvedPayload: {
+  ///       'id': data['id'],
+  ///       'name': data['name'],
+  ///       'version': data['version'],  // Updated by server
+  ///     },
+  ///   );
+  /// }
+  /// ```
   final Map<String, dynamic>? resolvedPayload;
 
   const SyncResult({
@@ -61,9 +83,7 @@ class SyncResult {
   }
 
   /// Create a conflict result
-  factory SyncResult.conflict({
-    required Map<String, dynamic> conflictData,
-  }) {
+  factory SyncResult.conflict({required Map<String, dynamic> conflictData}) {
     return SyncResult(
       success: false,
       conflictData: conflictData,

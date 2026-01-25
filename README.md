@@ -106,6 +106,21 @@ abstract class RemoteAdapter<T> {
 
 **Adapters must ensure idempotency** using the `operationId`.
 
+**Use `resolvedPayload`** to update local entities with server data (e.g., version fields, timestamps):
+
+```dart
+return SyncResult.success(
+  serverId: data['id'],
+  resolvedPayload: {
+    'id': data['id'],
+    'name': data['name'],
+    'version': data['version'],  // Server-managed field
+  },
+);
+```
+
+The SyncEngine will automatically call `StorageAdapter.saveEntity()` with the payload.
+
 ### 5. **Storage Adapter**
 
 Abstract interface for local storage:

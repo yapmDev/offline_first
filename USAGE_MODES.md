@@ -4,17 +4,18 @@ The `offline_first` package supports two distinct usage patterns depending on wh
 
 ---
 
-## 🎯 Mode 1: Operation Logging Only (Recommended for Existing Apps)
+## 🎯 Mode 1: Hybrid Mode (Recommended for Existing Apps)
 
 **Use this mode when:**
 - You have existing storage (Hive, SQLite, Isar, etc.)
 - You want to add offline-first sync to an existing app
 - You want clear separation of concerns
+- **You need to sync server-managed fields** (version, timestamps, auto-generated IDs)
 - **This is the recommended approach for most real-world apps**
 
 ### How It Works
 
-Your app remains in full control of entity storage. OfflineStore ONLY manages the operation log for synchronization.
+Your app remains in full control of entity storage for business operations. OfflineStore manages the operation log AND updates entities with server data after successful sync.
 
 ```dart
 // 1. Your app saves to its own storage
@@ -22,6 +23,9 @@ await tagBox.put(tagId, tagModel);
 
 // 2. Then logs the operation for sync
 await offlineStore.logCreate('tag', tagId, tagData);
+
+// 3. After sync, OfflineStore automatically updates entity with server data
+//    (e.g., version fields, timestamps) via StorageAdapter.saveEntity()
 ```
 
 ### Architecture
@@ -105,20 +109,28 @@ class TagRepositoryImpl implements TagRepository {
 }
 ```
 
-### StorageAdapter Setup (Operation Log Only)
+### StorageAdapter Setup (Hybrid Mode)
 
-Since you're not using OfflineStore for entity storage, StorageAdapter only needs to handle operations and metadata:
+The StorageAdapter handles operations, metadata, AND entity updates after sync:
 
 ```dart
 @singleton
 class HiveStorageAdapter implements StorageAdapter {
   Box<Map>? _operationsBox;
   Box? _metadataBox;
+  
+  // Your app's existing entity boxes
+  late Box<TagModel> _tagBox;
+  late Box<ProductModel> _productBox;
 
   @override
   Future<void> initialize() async {
     _operationsBox = await Hive.openBox<Map>('operations');
     _metadataBox = await Hive.openBox('syncMetadata');
+    
+    // Open your existing entity boxes
+    _tagBox = await Hive.openBox<TagModel>('tags');
+    _productBox = await Hive.openBox<ProductModel>('products');
   }
 
   // ========== Operation Log Operations ==========
@@ -150,33 +162,190 @@ class HiveStorageAdapter implements StorageAdapter {
     return _metadataBox!.get(key);
   }
 
-  // ========== Entity Operations (NOT USED in this mode) ==========
+  // ========== Entity Operations ==========
+  // Called by SyncEngine to update entities with server data after sync
 
   @override
-  Future<void> saveEntity(String entityType, String entityId, Map<String, dynamic> data) async {
-    throw UnsupportedError('Use app storage directly, not OfflineStore');
+  Future<void> saveEntity(
+    String entityType,
+    String entityId,
+    Map<String, dynamic> data,
+  ) async {
+    // Update your app's storage with server data (e.g., version fields)
+    switch (entityType) {
+      case 'tag':
+        final model = TagModel.fromJson(data);
+        await _tagBox.put(entityId, model);
+        break;
+      case 'product':
+        final model = ProductModel.fromJson(data);
+        await _productBox.put(entityId, model);
+        break;
+      default:
+        throw UnsupportedError('Unknown entity type: $entityType');
+    }
   }
 
   @override
-  Future<Map<String, dynamic>?> getEntity(String entityType, String entityId) async {
-    throw UnsupportedError('Use app storage directly, not OfflineStore');
+  Future<Map<String, dynamic>?> getEntity(
+    String entityType,
+    String entityId,
+  ) async {
+    // Used for conflict resolution - read from your app's storage
+    switch (entityType) {
+      case 'tag':
+        return _tagBox.get(entityId)?.toJson();
+      case 'product':
+        return _productBox.get(entityId)?.toJson();
+      default:
+        return null;
+    }
   }
 
-  // ... other entity methods throw UnsupportedError
+  @override
+  Future<List<Map<String, dynamic>>> getAllEntities(String entityType) async {
+    switch (entityType) {
+      case 'tag':
+        return _tagBox.values.map((m) => m.toJson()).toList();
+      case 'product':
+        return _productBox.values.map((m) => m.toJson()).toList();
+      default:
+        return [];
+    }
+  }
+
+  @override
+  Future<void> deleteEntity(String entityType, String entityId) async {
+    switch (entityType) {
+      case 'tag':
+        await _tagBox.delete(entityId);
+        break;
+      case 'product':
+        await _productBox.delete(entityId);
+        break;
+    }
+  }
+
+  @override
+  Future<bool> entityExists(String entityType, String entityId) async {
+    switch (entityType) {
+      case 'tag':
+        return _tagBox.containsKey(entityId);
+      case 'product':
+        return _productBox.containsKey(entityId);
+      default:
+        return false;
+    }
+  }
 }
 ```
 
-### API Reference (Operation Logging Mode)
+### Updating Entities After Sync with `resolvedPayload`
+
+When your RemoteAdapter receives a response from the server, use `resolvedPayload` to update the local entity with server-managed fields:
+
+```dart
+@injectable
+class TagRemoteAdapter implements RemoteAdapter<TagModel> {
+  final DioClient _dioClient;
+
+  @override
+  Future<SyncResult> create(Operation operation) async {
+    final response = await _dioClient.post(
+      '/api/tags',
+      data: operation.payload,
+      headers: {'X-Operation-Id': operation.operationId},
+    );
+
+    if (response.statusCode == 201) {
+      final data = response.data as Map<String, dynamic>;
+      
+      // Build complete payload with server data
+      final resolvedPayload = {
+        'id': data['id'],
+        'name': data['name'],
+        'color': data['color'],
+        'version': data['version'],        // ← Server-managed field
+        'createdAt': data['createdAt'],    // ← Server-managed field
+      };
+      
+      return SyncResult.success(
+        serverId: data['id'],
+        serverTimestamp: DateTime.parse(data['updatedAt']).millisecondsSinceEpoch,
+        resolvedPayload: resolvedPayload,  // ← SyncEngine calls saveEntity()
+      );
+    }
+    
+    // Handle errors...
+  }
+
+  @override
+  Future<SyncResult> update(Operation operation) async {
+    final version = operation.payload['version'];  // Current version from Hive
+    
+    final response = await _dioClient.put(
+      '/api/tags/${operation.entityId}',
+      data: {
+        ...operation.payload,
+        'version': version,  // For optimistic locking
+      },
+      headers: {'X-Operation-Id': operation.operationId},
+    );
+
+    if (response.statusCode == 200) {
+      final data = response.data as Map<String, dynamic>;
+      
+      // Update with new version from server
+      final resolvedPayload = {
+        'id': data['id'],
+        'name': data['name'],
+        'color': data['color'],
+        'version': data['version'],        // ← Incremented by server
+        'updatedAt': data['updatedAt'],
+      };
+      
+      return SyncResult.success(
+        serverTimestamp: DateTime.parse(data['updatedAt']).millisecondsSinceEpoch,
+        resolvedPayload: resolvedPayload,  // ← Updates Hive with new version
+      );
+    } else if (response.statusCode == 409) {
+      // Version conflict
+      return SyncResult.conflict(conflictData: response.data);
+    }
+    
+    // Handle other errors...
+  }
+}
+```
+
+**How it works:**
+1. RemoteAdapter sends operation to server
+2. Server processes and returns updated entity (with version++, timestamps, etc.)
+3. RemoteAdapter returns `SyncResult.success(resolvedPayload: updatedData)`
+4. SyncEngine automatically calls `StorageAdapter.saveEntity()` with the payload
+5. Your Hive box is updated with server data
+6. Operation is marked as synced and removed from log
+
+**Use cases for `resolvedPayload`:**
+- ✅ Optimistic locking (version fields)
+- ✅ Server-generated timestamps (createdAt, updatedAt)
+- ✅ Auto-increment IDs or UUIDs
+- ✅ Computed fields (e.g., fullName from firstName + lastName)
+- ✅ Normalized data from server
+
+### API Reference (Hybrid Mode)
 
 | Method | Description |
 |--------|-------------|
-| `logCreate(entityType, entityId, payload)` | Log a CREATE operation without saving entity |
-| `logUpdate(entityType, entityId, payload)` | Log an UPDATE operation without saving entity |
-| `logDelete(entityType, entityId)` | Log a DELETE operation without deleting entity |
+| `logCreate(entityType, entityId, payload)` | Log a CREATE operation (entity already saved by app) |
+| `logUpdate(entityType, entityId, payload)` | Log an UPDATE operation (entity already updated by app) |
+| `logDelete(entityType, entityId)` | Log a DELETE operation (entity already deleted by app) |
 | `logCustom(entityType, entityId, name, payload)` | Log a custom operation |
 | `sync()` | Synchronize all pending operations with remote |
 | `getPendingOperationsCount()` | Get count of operations waiting for sync |
 | `syncStatusStream` | Listen to sync progress events |
+
+**Note:** After successful sync, if RemoteAdapter returns `resolvedPayload`, the SyncEngine will call `StorageAdapter.saveEntity()` to update the local entity with server data.
 
 ---
 
@@ -344,13 +513,15 @@ class HiveStorageAdapter implements StorageAdapter {
 
 ## 📊 Comparison
 
-| Aspect | Operation Logging Mode | Source of Truth Mode |
-|--------|------------------------|----------------------|
+| Aspect | Hybrid Mode | Source of Truth Mode |
+|--------|-------------|----------------------|
 | **Entity Storage** | App manages (Hive/SQLite) | OfflineStore manages |
 | **Operation Logging** | OfflineStore | OfflineStore |
+| **Server Data Sync** | ✅ Via resolvedPayload | ✅ Automatic |
 | **Separation of Concerns** | ✅ High | ❌ Coupled |
 | **Existing App Integration** | ✅ Easy | ❌ Requires migration |
 | **Repository Pattern** | ✅ Preserved | Changes required |
+| **Optimistic Locking** | ✅ Supported | ✅ Supported |
 | **Complexity** | Medium | Low |
 | **Recommended For** | Production apps | Prototypes/New apps |
 
