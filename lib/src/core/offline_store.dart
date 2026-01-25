@@ -89,10 +89,107 @@ class OfflineStore {
     }
   }
 
-  // ========== CRUD Operations ==========
+  // ========== Operation Logging (Recommended) ==========
+
+  /// Log a CREATE operation without modifying local storage
+  /// The app is responsible for saving the entity to its own storage
+  Future<void> logCreate(
+    String entityType,
+    String entityId,
+    Map<String, dynamic> payload,
+  ) async {
+    _ensureInitialized();
+
+    final operation = Operation(
+      operationId: _uuid.v4(),
+      entityType: entityType,
+      entityId: entityId,
+      operationType: OperationType.create,
+      payload: payload,
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      status: OperationStatus.pending,
+      deviceId: _config.deviceId,
+    );
+
+    await _operationLog.append(operation);
+  }
+
+  /// Log an UPDATE operation without modifying local storage
+  /// The app is responsible for updating the entity in its own storage
+  Future<void> logUpdate(
+    String entityType,
+    String entityId,
+    Map<String, dynamic> payload,
+  ) async {
+    _ensureInitialized();
+
+    final operation = Operation(
+      operationId: _uuid.v4(),
+      entityType: entityType,
+      entityId: entityId,
+      operationType: OperationType.update,
+      payload: payload,
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      status: OperationStatus.pending,
+      deviceId: _config.deviceId,
+    );
+
+    await _operationLog.append(operation);
+  }
+
+  /// Log a DELETE operation without modifying local storage
+  /// The app is responsible for deleting the entity from its own storage
+  Future<void> logDelete(
+    String entityType,
+    String entityId,
+  ) async {
+    _ensureInitialized();
+
+    final operation = Operation(
+      operationId: _uuid.v4(),
+      entityType: entityType,
+      entityId: entityId,
+      operationType: OperationType.delete,
+      payload: {},
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      status: OperationStatus.pending,
+      deviceId: _config.deviceId,
+    );
+
+    await _operationLog.append(operation);
+  }
+
+  /// Log a CUSTOM operation without modifying local storage
+  Future<void> logCustom(
+    String entityType,
+    String entityId,
+    String operationName,
+    Map<String, dynamic> payload,
+  ) async {
+    _ensureInitialized();
+
+    final operation = Operation(
+      operationId: _uuid.v4(),
+      entityType: entityType,
+      entityId: entityId,
+      operationType: OperationType.custom,
+      customOperationName: operationName,
+      payload: payload,
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      status: OperationStatus.pending,
+      deviceId: _config.deviceId,
+    );
+
+    await _operationLog.append(operation);
+  }
+
+  // ========== CRUD Operations (Legacy - manages both storage and logging) ==========
 
   /// Save an entity (create or update)
   /// This creates an operation and applies it locally immediately
+  ///
+  /// NOTE: For apps with existing storage, prefer using logCreate/logUpdate
+  /// and managing your own storage separately
   Future<void> save(
     String entityType,
     String entityId,
@@ -127,6 +224,9 @@ class OfflineStore {
   }
 
   /// Delete an entity
+  ///
+  /// NOTE: For apps with existing storage, prefer using logDelete
+  /// and managing your own storage separately
   Future<void> delete(String entityType, String entityId) async {
     _ensureInitialized();
 
@@ -149,44 +249,35 @@ class OfflineStore {
     await _operationLog.append(operation);
   }
 
-  /// Get an entity by ID
+  // ========== Storage Operations (Legacy - for apps using OfflineStore as source of truth) ==========
+
+  /// Get an entity by ID from storage
+  ///
+  /// NOTE: For apps with existing storage, read from your own storage instead
   Future<Map<String, dynamic>?> get(String entityType, String entityId) async {
     _ensureInitialized();
     return _storage.getEntity(entityType, entityId);
   }
 
-  /// Get all entities of a type
+  /// Get all entities of a type from storage
+  ///
+  /// NOTE: For apps with existing storage, read from your own storage instead
   Future<List<Map<String, dynamic>>> getAll(String entityType) async {
     _ensureInitialized();
     return _storage.getAllEntities(entityType);
   }
 
   /// Execute a custom operation
+  ///
+  /// NOTE: For apps with existing storage, prefer using logCustom
+  @Deprecated('Use logCustom instead for apps with existing storage')
   Future<void> executeCustomOperation(
     String entityType,
     String entityId,
     String operationName,
     Map<String, dynamic> payload,
   ) async {
-    _ensureInitialized();
-
-    final operation = Operation(
-      operationId: _uuid.v4(),
-      entityType: entityType,
-      entityId: entityId,
-      operationType: OperationType.custom,
-      customOperationName: operationName,
-      payload: payload,
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-      status: OperationStatus.pending,
-      deviceId: _config.deviceId,
-    );
-
-    // Note: custom operations may or may not modify local state
-    // This depends on the business logic
-
-    // Add to operation log
-    await _operationLog.append(operation);
+    await logCustom(entityType, entityId, operationName, payload);
   }
 
   // ========== Sync Operations ==========
