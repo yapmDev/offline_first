@@ -15,18 +15,42 @@ enum SyncStatus {
   error,
 }
 
+/// Represents the current phase during sync
+enum SyncPhase {
+  /// Initial state, not syncing
+  idle,
+
+  /// Preparing: fetching pending operations
+  preparing,
+
+  /// Reducing: squashing/optimizing operations
+  reducing,
+
+  /// Syncing: sending operations to remote
+  syncing,
+
+  /// Completed successfully
+  completed,
+}
+
 /// Sync status event
 class SyncStatusEvent {
   final SyncStatus status;
+  final SyncPhase phase;
   final int totalOperations;
   final int completedOperations;
+  final int reducedCount;
   final String? errorMessage;
+  final String? currentOperation;
 
   const SyncStatusEvent({
     required this.status,
+    this.phase = SyncPhase.idle,
     this.totalOperations = 0,
     this.completedOperations = 0,
+    this.reducedCount = 0,
     this.errorMessage,
+    this.currentOperation,
   });
 
   double get progress {
@@ -99,25 +123,42 @@ class SyncEngine {
     _updateStatus(SyncStatus.syncing);
 
     try {
-      // Get all pending operations
+      // Phase 1: Preparing - Get all pending operations
+      _emitPhase(SyncPhase.preparing);
       var pendingOps = await _operationLog.getPendingOperations();
+      final initialCount = pendingOps.length;
 
       if (pendingOps.isEmpty) {
+        _emitPhase(SyncPhase.completed);
         _updateStatus(SyncStatus.idle);
         _isSyncing = false;
         return;
       }
 
-      // Optionally reduce operations
+      int reducedCount = 0;
+
+      // Phase 2: Reducing - Optionally reduce operations
       if (_config.enableOperationReduction) {
+        _emitPhase(SyncPhase.reducing, totalOperations: initialCount);
         pendingOps = await _reduceOperations(pendingOps);
+        reducedCount = initialCount - pendingOps.length;
       }
 
-      _emitProgress(pendingOps.length, 0);
+      // Phase 3: Syncing - Send operations to remote
+      _emitProgress(pendingOps.length, 0, reducedCount: reducedCount, phase: SyncPhase.syncing);
 
       // Sync operations in order
       int completed = 0;
       for (final operation in pendingOps) {
+        final operationDesc = '${operation.operationType.name} ${operation.entityType}';
+        _emitProgress(
+          pendingOps.length,
+          completed,
+          reducedCount: reducedCount,
+          phase: SyncPhase.syncing,
+          currentOperation: operationDesc,
+        );
+
         final success = await _syncOperation(operation);
 
         if (!success && _config.stopOnError) {
@@ -130,12 +171,19 @@ class SyncEngine {
         }
 
         completed++;
-        _emitProgress(pendingOps.length, completed);
+        _emitProgress(
+          pendingOps.length,
+          completed,
+          reducedCount: reducedCount,
+          phase: SyncPhase.syncing,
+        );
       }
 
       // Save last sync time
       await _storage.saveMetadata('lastSyncTime', DateTime.now().millisecondsSinceEpoch);
 
+      // Phase 4: Completed
+      _emitPhase(SyncPhase.completed);
       _updateStatus(SyncStatus.idle);
     } catch (e) {
       _updateStatus(SyncStatus.error, errorMessage: e.toString());
@@ -406,17 +454,39 @@ class SyncEngine {
     _statusController.add(
       SyncStatusEvent(
         status: status,
+        phase: status == SyncStatus.idle ? SyncPhase.idle : SyncPhase.syncing,
         errorMessage: errorMessage,
       ),
     );
   }
 
-  void _emitProgress(int total, int completed) {
+  void _emitProgress(
+    int total,
+    int completed, {
+    int reducedCount = 0,
+    SyncPhase phase = SyncPhase.syncing,
+    String? currentOperation,
+  }) {
     _statusController.add(
       SyncStatusEvent(
         status: SyncStatus.syncing,
+        phase: phase,
         totalOperations: total,
         completedOperations: completed,
+        reducedCount: reducedCount,
+        currentOperation: currentOperation,
+      ),
+    );
+  }
+
+  void _emitPhase(SyncPhase phase, {int totalOperations = 0}) {
+    _statusController.add(
+      SyncStatusEvent(
+        status: phase == SyncPhase.idle || phase == SyncPhase.completed
+            ? SyncStatus.idle
+            : SyncStatus.syncing,
+        phase: phase,
+        totalOperations: totalOperations,
       ),
     );
   }
