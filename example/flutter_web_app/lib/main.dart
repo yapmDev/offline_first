@@ -94,7 +94,7 @@ class _HomePageState extends State<HomePage> {
     final ops = await store.getPendingOperations();
 
     setState(() {
-      products = data.map((m) => ProductOfflineExtension.fromMap(m)).toList();
+      products = data.map((m) => Product.fromMap(m)).toList();
       pendingOperations = ops;
     });
   }

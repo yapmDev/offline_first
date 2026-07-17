@@ -26,7 +26,7 @@ class ProductRemoteAdapter extends RemoteAdapter<Product> {
       }
 
       // Send to backend
-      final product = ProductOfflineExtension.fromMap(operation.payload);
+      final product = Product.fromMap(operation.payload);
       await backend.createProduct(product);
 
       // Mark operation as processed

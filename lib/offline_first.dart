@@ -22,9 +22,3 @@ export 'src/sync/operation_reducer.dart';
 export 'src/conflict/conflict_resolver.dart';
 export 'src/conflict/last_write_wins_resolver.dart';
 export 'src/conflict/field_level_merge_resolver.dart';
-
-// Annotations
-export 'src/annotations/offline_entity.dart';
-export 'src/annotations/offline_field.dart';
-export 'src/annotations/offline_ignore.dart';
-export 'src/annotations/conflict_policy.dart';
