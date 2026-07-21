@@ -25,6 +25,11 @@ class OperationLog {
     return _storage.getOperationsForEntity(entityType, entityId);
   }
 
+  /// Get every operation still logged for an entity type, any status
+  Future<List<Operation>> getOperationsForType(String entityType) async {
+    return _storage.getOperationsForType(entityType);
+  }
+
   /// Update an operation (e.g., change status)
   Future<void> update(Operation operation) async {
     await _storage.updateOperation(operation);

@@ -405,8 +405,18 @@ class SyncEngine {
 
   /// Handle sync failure
   Future<bool> _handleFailure(Operation operation, SyncResult result) async {
-    if (!result.isRetryable || operation.retryCount >= _config.maxRetries) {
-      // Max retries reached or not retryable
+    if (!result.isRetryable) {
+      // Retrying cannot fix this (4xx, validation, business rule): park it
+      // permanently instead of re-sending it on every sync forever.
+      await _operationLog.update(
+        operation.copyWith(
+          status: OperationStatus.failedPermanent,
+          errorMessage: result.errorMessage,
+        ),
+      );
+      return false;
+    } else if (operation.retryCount >= _config.maxRetries) {
+      // Retryable but out of attempts for now; a later sync may pick it up.
       await _operationLog.update(
         operation.copyWith(
           status: OperationStatus.failed,

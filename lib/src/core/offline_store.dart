@@ -309,6 +309,19 @@ class OfflineStore {
     return _operationLog.getPendingOperations();
   }
 
+  /// Ids of [entityType] entities that still carry an unsynced local write,
+  /// whatever the operation's status.
+  ///
+  /// A remote refresh must not overwrite nor prune these: the server does not
+  /// know about them yet, so its version is stale by definition. Dropping the
+  /// guard loses the local edit (overwrite) or the whole record (prune of an
+  /// id the server has never seen).
+  Future<Set<String>> unsyncedEntityIds(String entityType) async {
+    _ensureInitialized();
+    final operations = await _operationLog.getOperationsForType(entityType);
+    return operations.map((op) => op.entityId).toSet();
+  }
+
   // ========== Lifecycle ==========
 
   /// Close the store and cleanup resources

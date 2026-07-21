@@ -78,12 +78,17 @@ class InMemoryStorageAdapter implements StorageAdapter {
     return _operations[operationId];
   }
 
+  /// See [StorageAdapter.getPendingOperations] for why `syncing` and `failed`
+  /// are eligible and `failedPermanent` is not.
+  static bool _isSyncable(Operation op) =>
+      op.status == OperationStatus.pending ||
+      op.status == OperationStatus.syncing ||
+      op.status == OperationStatus.failed;
+
   @override
   Future<List<Operation>> getPendingOperations() async {
     _ensureInitialized();
-    final pending = _operations.values
-        .where((op) => op.status == OperationStatus.pending)
-        .toList();
+    final pending = _operations.values.where(_isSyncable).toList();
     pending.sort((a, b) => a.timestamp.compareTo(b.timestamp));
     return pending;
   }
@@ -93,6 +98,15 @@ class InMemoryStorageAdapter implements StorageAdapter {
     _ensureInitialized();
     return _operations.values
         .where((op) => op.entityType == entityType && op.entityId == entityId)
+        .toList()
+      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+  }
+
+  @override
+  Future<List<Operation>> getOperationsForType(String entityType) async {
+    _ensureInitialized();
+    return _operations.values
+        .where((op) => op.entityType == entityType)
         .toList()
       ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
   }
@@ -120,9 +134,7 @@ class InMemoryStorageAdapter implements StorageAdapter {
   @override
   Future<int> getPendingOperationsCount() async {
     _ensureInitialized();
-    return _operations.values
-        .where((op) => op.status == OperationStatus.pending)
-        .length;
+    return _operations.values.where(_isSyncable).length;
   }
 
   // ============ Metadata Operations ============

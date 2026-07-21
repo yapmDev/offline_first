@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Non-retryable failures no longer retry forever**: `_handleFailure` collapsed
+  "the network was down" and "the server rejected this" into a single `failed`
+  status. Any storage adapter that made `failed` operations eligible for sync
+  (the documented behaviour, so a network failure eventually recovers) therefore
+  re-sent 4xx-rejected operations on every single sync, forever, and kept the
+  pending count permanently above zero.
+- **Orphaned operations are recovered**: an operation left in `syncing` by a
+  process that died mid-flight was excluded from `getPendingOperations()`, so it
+  was never retried *and* never counted as pending — an invisible lost write.
+
+### Added
+
+- **`OperationStatus.failedPermanent`**: terminal status for failures retrying
+  cannot fix. Excluded from the sync queue; needs the user to act on it.
+- **`StorageAdapter.getOperationsForType(entityType)`** and
+  **`OfflineStore.unsyncedEntityIds(entityType)`**: the set of entity ids that
+  still carry a local write the server has not acknowledged. A local-first
+  refresh must skip these — overwriting one drops the local edit, and pruning an
+  id the server has never seen deletes the record outright.
+
+### Changed
+
+- **`StorageAdapter.getPendingOperations()` contract is now documented**:
+  eligible means `pending`, `syncing` (orphan recovery) and `failed`, never
+  `synced` or `failedPermanent`. `InMemoryStorageAdapter` returned only
+  `pending`, which silently diverged from what real adapters were doing.
+
+### Migration
+
+Storage adapter implementations must add `getOperationsForType` and align
+`getPendingOperations`/`getPendingOperationsCount` with the contract above.
+Persisted operations are unaffected: `failedPermanent` only appears on new
+failures.
+
 ## [0.1.1] - 2026-01-25
 
 ### Documentation

@@ -34,11 +34,27 @@ abstract class StorageAdapter {
   /// Get an operation by ID
   Future<Operation?> getOperation(String operationId);
 
-  /// Get all pending operations (ordered by timestamp)
+  /// Get all operations eligible for a sync attempt (ordered by timestamp).
+  ///
+  /// Eligible means [OperationStatus.pending], [OperationStatus.syncing] or
+  /// [OperationStatus.failed]:
+  /// - `syncing` is only ever observed here when a previous run died
+  ///   mid-flight (the sync engine is single-flight and snapshots this list
+  ///   once at the start), so including it revives orphaned operations.
+  /// - `failed` exhausted its retries for a *retryable* reason, so a later
+  ///   sync is worth attempting.
+  ///
+  /// Must exclude [OperationStatus.synced] and
+  /// [OperationStatus.failedPermanent] — the latter never retries on its own.
   Future<List<Operation>> getPendingOperations();
 
   /// Get all operations for a specific entity
   Future<List<Operation>> getOperationsForEntity(String entityType, String entityId);
+
+  /// Get every operation still in the log for [entityType], whatever its
+  /// status. Used to tell which entities have local writes the server has not
+  /// acknowledged yet, so a remote refresh does not overwrite them.
+  Future<List<Operation>> getOperationsForType(String entityType);
 
   /// Update an operation's status
   Future<void> updateOperation(Operation operation);

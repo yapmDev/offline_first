@@ -13,7 +13,16 @@ enum OperationStatus {
   pending,
   syncing,
   synced,
+
+  /// Failed for a retryable reason (network, 5xx) after exhausting
+  /// [SyncConfig.maxRetries]. Still eligible for a new attempt on the next
+  /// sync — the condition that caused it is expected to clear on its own.
   failed,
+
+  /// Failed for a reason retrying cannot fix (4xx, validation, business
+  /// rule). Never attempted again automatically: it needs the user to edit,
+  /// discard or otherwise act on it.
+  failedPermanent,
 }
 
 /// Represents a domain operation to be synced
