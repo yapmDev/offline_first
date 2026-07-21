@@ -5,8 +5,23 @@ import '../core/remote_adapter.dart';
 import '../core/sync_result.dart';
 import '../storage/storage_adapter.dart';
 import '../conflict/conflict_resolver.dart';
+import '../conflict/sync_conflict.dart';
 import '../core/conflict_resolution.dart';
 import 'operation_reducer.dart';
+
+/// What syncing one operation left behind.
+enum _SyncOutcome {
+  /// Applied on the server; the operation is gone from the log.
+  synced,
+
+  /// Still queued — a later sync will try again on its own.
+  retryable,
+
+  /// Parked: conflicted, or rejected in a way retrying cannot fix. Later
+  /// operations on the same entity are held back for this pass, since they
+  /// were built on the same assumption this one just disproved.
+  stalled,
+}
 
 /// Represents the current sync status
 enum SyncStatus {
@@ -87,6 +102,7 @@ class SyncEngine {
   final SyncConfig _config;
 
   final _statusController = StreamController<SyncStatusEvent>.broadcast();
+  final _conflictController = StreamController<SyncConflict>.broadcast();
   SyncStatus _currentStatus = SyncStatus.idle;
   bool _isSyncing = false;
 
@@ -106,6 +122,13 @@ class SyncEngine {
 
   /// Stream of sync status events
   Stream<SyncStatusEvent> get statusStream => _statusController.stream;
+
+  /// Conflicts raised as they are detected.
+  ///
+  /// Live only: a listener attached later will not see earlier conflicts, so
+  /// read `OfflineStore.getConflicts()` on startup and use this to stay
+  /// current.
+  Stream<SyncConflict> get conflictStream => _conflictController.stream;
 
   /// Current sync status
   SyncStatus get status => _currentStatus;
@@ -149,7 +172,22 @@ class SyncEngine {
 
       // Sync operations in order
       int completed = 0;
+
+      /// Entities whose queue is stalled for the rest of this pass: once a
+      /// write is refused as conflicting or rejected outright, every later
+      /// write to the same entity is built on the same bad assumption. Sending
+      /// them anyway would pile up failures — and, worse, could apply half of a
+      /// sequence. Other entities keep syncing normally.
+      final stalledEntities = <String>{};
+
       for (final operation in pendingOps) {
+        final entityKey = '${operation.entityType}:${operation.entityId}';
+        if (stalledEntities.contains(entityKey)) {
+          // Se deja pendiente a propósito: vuelve a intentarse en la próxima
+          // pasada, una vez resuelto lo que bloqueó a esta entidad.
+          continue;
+        }
+
         final operationDesc = '${operation.operationType.name} ${operation.entityType}';
         _emitProgress(
           pendingOps.length,
@@ -159,7 +197,11 @@ class SyncEngine {
           currentOperation: operationDesc,
         );
 
-        final success = await _syncOperation(operation);
+        final outcome = await _syncOperation(operation);
+        if (outcome == _SyncOutcome.stalled) {
+          stalledEntities.add(entityKey);
+        }
+        final success = outcome == _SyncOutcome.synced;
 
         if (!success && _config.stopOnError) {
           _updateStatus(
@@ -232,17 +274,18 @@ class SyncEngine {
   }
 
   /// Sync a single operation
-  Future<bool> _syncOperation(Operation operation) async {
+  Future<_SyncOutcome> _syncOperation(Operation operation) async {
     final adapter = _adapters[operation.entityType];
     if (adapter == null) {
-      // No adapter registered, mark as failed
+      // A missing adapter is a wiring mistake, not a transient error: retrying
+      // it every sync would never register the adapter.
       await _operationLog.update(
         operation.copyWith(
-          status: OperationStatus.failed,
+          status: OperationStatus.failedPermanent,
           errorMessage: 'No adapter registered for ${operation.entityType}',
         ),
       );
-      return false;
+      return _SyncOutcome.stalled;
     }
 
     // Mark as syncing
@@ -267,8 +310,8 @@ class SyncEngine {
           );
         }
 
-        return true;
-      } else if (result.conflictData != null) {
+        return _SyncOutcome.synced;
+      } else if (result.conflictData != null || result.serverVersion != null) {
         // Conflict detected
         return await _handleConflict(operation, result, adapter);
       } else {
@@ -281,130 +324,146 @@ class SyncEngine {
     }
   }
 
-  /// Handle conflict resolution
-  Future<bool> _handleConflict(
+  /// Handle a write the server refused as conflicting.
+  ///
+  /// A configured [ConflictResolver] gets first say; anything it declines to
+  /// settle — and everything when no resolver is configured — is parked for a
+  /// person to decide. Parking rather than failing is what keeps the write
+  /// recoverable instead of silently stuck.
+  Future<_SyncOutcome> _handleConflict(
     Operation operation,
     SyncResult result,
     RemoteAdapter<dynamic> adapter,
   ) async {
-    if (_conflictResolver == null) {
-      // No resolver configured, mark as failed
-      await _operationLog.update(
-        operation.copyWith(
-          status: OperationStatus.failed,
-          errorMessage: 'Conflict detected but no resolver configured',
-        ),
-      );
-      return false;
+    Map<String, dynamic>? serverState = result.conflictData;
+    if (serverState == null) {
+      // El backend rechazó sin devolver su estado. Sin estado no hay conflicto
+      // que mostrar, sólo un error opaco — vale la pena una llamada extra.
+      try {
+        serverState = await adapter.fetchRemoteState(operation.entityId);
+      } catch (_) {
+        // Se sigue sin estado remoto: el conflicto se puede descartar o
+        // reintentar, pero no comparar.
+      }
     }
 
     try {
-      // Get local state
-      final localData = await _storage.getEntity(
-        operation.entityType,
-        operation.entityId,
-      );
-      if (localData == null) {
-        // Entity doesn't exist locally anymore
-        await _operationLog.remove(operation.operationId);
-        return true;
+      final resolution = await _autoResolve(operation, serverState, result);
+      if (resolution != null) {
+        return await _applyResolution(operation, resolution, serverState, result);
       }
-
-      final localState = LocalState(
-        data: localData,
-        timestamp: operation.timestamp,
-      );
-
-      final remoteState = RemoteState(
-        data: result.conflictData!,
-        timestamp: result.serverTimestamp ?? DateTime.now().millisecondsSinceEpoch,
-      );
-
-      // Get all pending operations for this entity
-      final pendingOps = await _operationLog.getOperationsForEntity(
-        operation.entityType,
-        operation.entityId,
-      );
-
-      // Resolve conflict
-      final resolution = await _conflictResolver!.resolve(
-        localState,
-        remoteState,
-        pendingOps,
-      );
-
-      // Apply resolution
-      return await _applyResolution(operation, resolution, remoteState);
     } catch (e) {
-      await _operationLog.update(
-        operation.copyWith(
-          status: OperationStatus.failed,
-          errorMessage: 'Conflict resolution failed: $e',
-        ),
-      );
-      return false;
+      // Que un resolver automático falle no debe perder la operación: se
+      // estaciona igual y decide una persona.
+      await _park(operation, serverState, result, 'Conflict resolution failed: $e');
+      return _SyncOutcome.stalled;
     }
+
+    await _park(operation, serverState, result, result.errorMessage);
+    return _SyncOutcome.stalled;
+  }
+
+  /// Ask the configured resolver what to do, or null to defer to a person.
+  Future<Resolution?> _autoResolve(
+    Operation operation,
+    Map<String, dynamic>? serverState,
+    SyncResult result,
+  ) async {
+    if (_conflictResolver == null || serverState == null) return null;
+
+    final localData = await _storage.getEntity(
+      operation.entityType,
+      operation.entityId,
+    );
+    // La entidad ya no está local: no hay "lo mío" con qué comparar, así que
+    // ninguna estrategia automática puede decidir con fundamento.
+    if (localData == null) return null;
+
+    final pendingOps = await _operationLog.getOperationsForEntity(
+      operation.entityType,
+      operation.entityId,
+    );
+
+    return _conflictResolver!.resolve(
+      LocalState(data: localData, timestamp: operation.timestamp),
+      RemoteState(
+        data: serverState,
+        timestamp: result.serverTimestamp ?? DateTime.now().millisecondsSinceEpoch,
+      ),
+      pendingOps,
+    );
   }
 
   /// Apply conflict resolution
-  Future<bool> _applyResolution(
+  Future<_SyncOutcome> _applyResolution(
     Operation operation,
     Resolution resolution,
-    RemoteState remote,
+    Map<String, dynamic>? serverState,
+    SyncResult result,
   ) async {
     switch (resolution.strategy) {
       case ResolutionStrategy.useLocal:
-        // Retry the operation
+        // Rebase antes de reencolar: reenviarla tal cual chocaría contra el
+        // mismo chequeo de versión, una y otra vez.
         await _operationLog.update(
-          operation.copyWith(
-            status: OperationStatus.pending,
-            retryCount: operation.retryCount + 1,
-          ),
+          operation.rebased(baseVersion: result.serverVersion),
         );
-        return true;
+        return _SyncOutcome.stalled;
 
       case ResolutionStrategy.useRemote:
-        // Accept remote version
-        await _storage.saveEntity(
-          operation.entityType,
-          operation.entityId,
-          remote.data,
-        );
-        await _operationLog.remove(operation.operationId);
-        return true;
-
-      case ResolutionStrategy.merge:
-        // Apply merged data
-        if (resolution.mergedData != null) {
+        if (serverState != null) {
           await _storage.saveEntity(
             operation.entityType,
             operation.entityId,
-            resolution.mergedData!,
+            serverState,
           );
-          // Create new operation with merged data
-          final mergedOp = operation.copyWith(
-            payload: resolution.mergedData,
-            status: OperationStatus.pending,
-          );
-          await _operationLog.update(mergedOp);
-          return true;
         }
-        return false;
+        await _operationLog.remove(operation.operationId);
+        return _SyncOutcome.synced;
 
-      case ResolutionStrategy.manual:
-        // Mark for manual intervention
+      case ResolutionStrategy.merge:
+        if (resolution.mergedData == null) {
+          await _park(operation, serverState, result, 'Merge produced no data');
+          return _SyncOutcome.stalled;
+        }
+        await _storage.saveEntity(
+          operation.entityType,
+          operation.entityId,
+          resolution.mergedData!,
+        );
         await _operationLog.update(
-          operation.copyWith(
-            status: OperationStatus.failed,
-            errorMessage: 'Manual conflict resolution required',
+          operation.rebased(
+            baseVersion: result.serverVersion,
+            payload: resolution.mergedData,
           ),
         );
-        return false;
+        return _SyncOutcome.stalled;
+
+      case ResolutionStrategy.manual:
+        await _park(operation, serverState, result, 'Manual conflict resolution required');
+        return _SyncOutcome.stalled;
     }
   }
 
+  /// Park a conflicting operation until someone settles it.
+  Future<void> _park(
+    Operation operation,
+    Map<String, dynamic>? serverState,
+    SyncResult result,
+    String? errorMessage,
+  ) async {
+    final parked = operation.copyWith(
+      status: OperationStatus.conflicted,
+      conflictData: serverState,
+      conflictServerVersion: result.serverVersion,
+      errorMessage: errorMessage,
+    );
+    await _operationLog.update(parked);
+    _conflictController.add(SyncConflict(parked));
+  }
+
   /// Handle sync failure
-  Future<bool> _handleFailure(Operation operation, SyncResult result) async {
+  Future<_SyncOutcome> _handleFailure(Operation operation, SyncResult result) async {
     if (!result.isRetryable) {
       // Retrying cannot fix this (4xx, validation, business rule): park it
       // permanently instead of re-sending it on every sync forever.
@@ -414,7 +473,7 @@ class SyncEngine {
           errorMessage: result.errorMessage,
         ),
       );
-      return false;
+      return _SyncOutcome.stalled;
     } else if (operation.retryCount >= _config.maxRetries) {
       // Retryable but out of attempts for now; a later sync may pick it up.
       await _operationLog.update(
@@ -423,7 +482,7 @@ class SyncEngine {
           errorMessage: result.errorMessage,
         ),
       );
-      return false;
+      return _SyncOutcome.retryable;
     } else {
       // Retry later
       await _operationLog.update(
@@ -433,12 +492,12 @@ class SyncEngine {
           errorMessage: result.errorMessage,
         ),
       );
-      return true;
+      return _SyncOutcome.retryable;
     }
   }
 
   /// Handle exception during sync
-  Future<bool> _handleException(Operation operation, Object error) async {
+  Future<_SyncOutcome> _handleException(Operation operation, Object error) async {
     if (operation.retryCount >= _config.maxRetries) {
       await _operationLog.update(
         operation.copyWith(
@@ -446,7 +505,6 @@ class SyncEngine {
           errorMessage: error.toString(),
         ),
       );
-      return false;
     } else {
       await _operationLog.update(
         operation.copyWith(
@@ -455,8 +513,8 @@ class SyncEngine {
           errorMessage: error.toString(),
         ),
       );
-      return true;
     }
+    return _SyncOutcome.retryable;
   }
 
   void _updateStatus(SyncStatus status, {String? errorMessage}) {
@@ -503,5 +561,6 @@ class SyncEngine {
 
   void dispose() {
     _statusController.close();
+    _conflictController.close();
   }
 }

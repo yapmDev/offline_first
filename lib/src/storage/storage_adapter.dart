@@ -44,9 +44,12 @@ abstract class StorageAdapter {
   /// - `failed` exhausted its retries for a *retryable* reason, so a later
   ///   sync is worth attempting.
   ///
-  /// Must exclude [OperationStatus.synced] and
-  /// [OperationStatus.failedPermanent] — the latter never retries on its own.
+  /// Must exclude [OperationStatus.synced], [OperationStatus.failedPermanent]
+  /// and [OperationStatus.conflicted] — none of those resolve by retrying.
   Future<List<Operation>> getPendingOperations();
+
+  /// Get every operation in the given status, ordered by timestamp.
+  Future<List<Operation>> getOperationsByStatus(OperationStatus status);
 
   /// Get all operations for a specific entity
   Future<List<Operation>> getOperationsForEntity(String entityType, String entityId);

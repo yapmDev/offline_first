@@ -8,6 +8,7 @@ import '../storage/storage_adapter.dart';
 import '../sync/sync_engine.dart';
 import '../sync/operation_reducer.dart';
 import '../conflict/conflict_resolver.dart';
+import '../conflict/sync_conflict.dart';
 
 /// Configuration for the OfflineStore
 class OfflineStoreConfig {
@@ -116,11 +117,17 @@ class OfflineStore {
 
   /// Log an UPDATE operation without modifying local storage
   /// The app is responsible for updating the entity in its own storage
+  ///
+  /// [baseVersion] is the entity version this edit was made on top of. Pass it
+  /// and the backend can refuse a write built on stale data, which is what
+  /// surfaces a conflict instead of silently overwriting someone else. Omit it
+  /// and the write keeps whatever last-write-wins behaviour the backend had.
   Future<void> logUpdate(
     String entityType,
     String entityId,
-    Map<String, dynamic> payload,
-  ) async {
+    Map<String, dynamic> payload, {
+    int? baseVersion,
+  }) async {
     _ensureInitialized();
 
     final operation = Operation(
@@ -132,6 +139,7 @@ class OfflineStore {
       timestamp: DateTime.now().millisecondsSinceEpoch,
       status: OperationStatus.pending,
       deviceId: _config.deviceId,
+      baseVersion: baseVersion,
     );
 
     await _operationLog.append(operation);
@@ -141,8 +149,9 @@ class OfflineStore {
   /// The app is responsible for deleting the entity from its own storage
   Future<void> logDelete(
     String entityType,
-    String entityId,
-  ) async {
+    String entityId, {
+    int? baseVersion,
+  }) async {
     _ensureInitialized();
 
     final operation = Operation(
@@ -154,18 +163,24 @@ class OfflineStore {
       timestamp: DateTime.now().millisecondsSinceEpoch,
       status: OperationStatus.pending,
       deviceId: _config.deviceId,
+      baseVersion: baseVersion,
     );
 
     await _operationLog.append(operation);
   }
 
   /// Log a CUSTOM operation without modifying local storage
+  ///
+  /// Custom operations are usually deltas ("add 5", "record a payment"), which
+  /// stay correct whatever the entity version is — leave [baseVersion] unset
+  /// for those, or the backend will reject writes that were perfectly valid.
   Future<void> logCustom(
     String entityType,
     String entityId,
     String operationName,
-    Map<String, dynamic> payload,
-  ) async {
+    Map<String, dynamic> payload, {
+    int? baseVersion,
+  }) async {
     _ensureInitialized();
 
     final operation = Operation(
@@ -178,6 +193,7 @@ class OfflineStore {
       timestamp: DateTime.now().millisecondsSinceEpoch,
       status: OperationStatus.pending,
       deviceId: _config.deviceId,
+      baseVersion: baseVersion,
     );
 
     await _operationLog.append(operation);
@@ -320,6 +336,115 @@ class OfflineStore {
     _ensureInitialized();
     final operations = await _operationLog.getOperationsForType(entityType);
     return operations.map((op) => op.entityId).toSet();
+  }
+
+  // ========== Conflicts ==========
+
+  /// Conflicts raised as they are detected.
+  ///
+  /// Live only — call [getConflicts] on startup for the ones already parked.
+  Stream<SyncConflict> get conflictStream => _syncEngine.conflictStream;
+
+  /// Every conflict waiting on a decision.
+  Future<List<SyncConflict>> getConflicts() async {
+    _ensureInitialized();
+    final operations =
+        await _operationLog.getOperationsByStatus(OperationStatus.conflicted);
+    return operations.map(SyncConflict.new).toList();
+  }
+
+  /// Whether anything is waiting on a decision.
+  Future<int> getConflictCount() async {
+    _ensureInitialized();
+    final operations =
+        await _operationLog.getOperationsByStatus(OperationStatus.conflicted);
+    return operations.length;
+  }
+
+  /// Settle a parked conflict.
+  ///
+  /// [ConflictChoice.keepLocal] re-queues the write rebased onto the server's
+  /// version, optionally with a [payload] that replaces the original — that is
+  /// how a merge is applied, since only the caller knows the shape its backend
+  /// expects. Rebasing is what stops the retry from conflicting again.
+  ///
+  /// [ConflictChoice.keepRemote] adopts the server's state locally and drops
+  /// the write. [ConflictChoice.discard] drops the write and leaves local
+  /// state alone, for when the decision moves elsewhere.
+  ///
+  /// Throws [StateError] if the operation is gone or is not conflicted —
+  /// two devices resolving the same conflict should not both apply.
+  Future<void> resolveConflict(
+    String operationId,
+    ConflictChoice choice, {
+    Map<String, dynamic>? payload,
+  }) async {
+    _ensureInitialized();
+
+    final operation = await _operationLog.getOperation(operationId);
+    if (operation == null) {
+      throw StateError('Operation $operationId is no longer in the log');
+    }
+    if (!operation.isConflicted) {
+      throw StateError(
+        'Operation $operationId is ${operation.status.name}, not conflicted',
+      );
+    }
+
+    switch (choice) {
+      case ConflictChoice.keepLocal:
+        await _operationLog.update(
+          operation.rebased(
+            baseVersion: operation.conflictServerVersion,
+            payload: payload,
+          ),
+        );
+
+      case ConflictChoice.keepRemote:
+        final serverState = operation.conflictData;
+        if (serverState != null) {
+          await _storage.saveEntity(
+            operation.entityType,
+            operation.entityId,
+            serverState,
+          );
+        }
+        await _operationLog.remove(operationId);
+
+      case ConflictChoice.discard:
+        await _operationLog.remove(operationId);
+    }
+  }
+
+  /// Drop an operation from the queue whatever its status.
+  ///
+  /// For giving up on a write that cannot be sent — a permanent failure that
+  /// no edit will fix. Local state is left untouched.
+  Future<void> discardOperation(String operationId) async {
+    _ensureInitialized();
+    await _operationLog.remove(operationId);
+  }
+
+  /// Put a parked operation back in the queue.
+  ///
+  /// Useful for a permanent failure whose cause was fixed elsewhere (a
+  /// duplicate name freed up, a permission granted). A conflicted operation
+  /// should go through [resolveConflict] instead, so it gets rebased.
+  Future<void> retryOperation(String operationId) async {
+    _ensureInitialized();
+    final operation = await _operationLog.getOperation(operationId);
+    if (operation == null) {
+      throw StateError('Operation $operationId is no longer in the log');
+    }
+    await _operationLog.update(
+      operation.copyWith(status: OperationStatus.pending, retryCount: 0),
+    );
+  }
+
+  /// Operations that will not be retried on their own.
+  Future<List<Operation>> getFailedOperations() async {
+    _ensureInitialized();
+    return _operationLog.getOperationsByStatus(OperationStatus.failedPermanent);
   }
 
   // ========== Lifecycle ==========

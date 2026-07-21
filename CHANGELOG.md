@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — conflict detection and resolution
+
+- **`Operation.baseVersion`**: the entity version a write was made on top of,
+  sent to the backend so it can refuse writes built on stale data. Omitting it
+  keeps the backend's previous last-write-wins behaviour, so adopting this is
+  incremental. `logUpdate`/`logDelete`/`logCustom` take it as a named argument.
+- **`OperationStatus.conflicted`**: a refused write is now *parked* with the
+  server's state attached rather than failed. It is excluded from the sync
+  queue, survives restarts, and is settled by a decision — not by retrying.
+- **`SyncConflict` + `OfflineStore.conflictStream` / `getConflicts()` /
+  `getConflictCount()`**: everything needed to present the choice, including
+  the server state captured at the moment of refusal. Re-fetching later would
+  show a third state rather than the one the write actually lost against.
+- **`OfflineStore.resolveConflict(id, choice, {payload})`** with
+  `ConflictChoice.keepLocal` / `keepRemote` / `discard`. `keepLocal` **rebases**
+  the operation onto the server's version, optionally replacing the payload —
+  which is how a merge is applied, since only the caller knows the shape its
+  backend expects.
+- **`OfflineStore.getFailedOperations()` / `retryOperation` /
+  `discardOperation`**: permanently failed operations were unreachable, so a
+  write that could never be sent had no way out of the queue.
+- **`SyncResult.conflict` now carries `serverVersion` and `serverTimestamp`**.
+  Both matter: without the version a resolved conflict retries onto the same
+  stale base and conflicts again, and without the timestamp `LastWriteWinsResolver`
+  falls back to the local clock and compares a value against itself.
+
+### Changed — conflict detection and resolution
+
+- **A conflict no longer needs a `ConflictResolver`**. Previously, no resolver
+  meant the operation was marked failed with "no resolver configured" — the
+  common case produced a dead end. A resolver now gets first say if configured,
+  and anything it declines is parked for a person.
+- **A stalled entity holds back its own later writes for the rest of the pass**,
+  while other entities keep syncing. Writes queued after a refused one were
+  built on the same assumption it just disproved.
+- **A missing `RemoteAdapter` is now `failedPermanent`** rather than `failed`.
+  Retrying never registers an adapter, so it re-sent forever.
+- **`fetchRemoteState` is finally used**: it fills in the server state when the
+  backend refuses without returning one. It had been declared, implemented by
+  adapters, and never called.
+
+### Fixed — conflict detection and resolution
+
+- **Resolving "keep mine" no longer loops forever.** It re-queued the operation
+  unchanged, so it hit the same version check and conflicted again on every
+  sync. It now rebases onto the server's version.
+- **A conflict on an entity deleted locally no longer discards the write
+  silently.** It removed the operation and reported success.
+- **A conflict resolver that throws no longer loses the write.** It was marked
+  failed; it is now parked for a person to settle.
+
+### Migration
+
+`StorageAdapter` implementations must add `getOperationsByStatus` and exclude
+`conflicted` from `getPendingOperations`.
+
 ### Fixed
 
 - **Non-retryable failures no longer retry forever**: `_handleFailure` collapsed

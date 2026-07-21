@@ -30,6 +30,11 @@ class OperationLog {
     return _storage.getOperationsForType(entityType);
   }
 
+  /// Get every operation in a given status
+  Future<List<Operation>> getOperationsByStatus(OperationStatus status) async {
+    return _storage.getOperationsByStatus(status);
+  }
+
   /// Update an operation (e.g., change status)
   Future<void> update(Operation operation) async {
     await _storage.updateOperation(operation);

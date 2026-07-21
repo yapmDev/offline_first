@@ -23,6 +23,11 @@ enum OperationStatus {
   /// rule). Never attempted again automatically: it needs the user to edit,
   /// discard or otherwise act on it.
   failedPermanent,
+
+  /// The server refused the write because it was made on top of a version
+  /// that has since moved on. Parked with the server's state attached until
+  /// someone decides what to keep — see `OfflineStore.resolveConflict`.
+  conflicted,
 }
 
 /// Represents a domain operation to be synced
@@ -61,6 +66,24 @@ class Operation {
   /// Optional: Custom operation name for OperationType.custom
   final String? customOperationName;
 
+  /// Version of the entity this write was made on top of.
+  ///
+  /// Sent to the backend so it can refuse the write if the entity has moved
+  /// on since — that refusal is what turns a silent overwrite into a
+  /// conflict. Null means the caller does not version this entity, which
+  /// leaves the backend's previous last-write-wins behaviour untouched.
+  final int? baseVersion;
+
+  /// Server state captured when this operation was refused as conflicting.
+  ///
+  /// Kept on the operation so the conflict survives a restart: whoever
+  /// resolves it may do so hours later, and re-fetching would show a third
+  /// state rather than the one the write actually lost against.
+  final Map<String, dynamic>? conflictData;
+
+  /// Entity version the server reported when refusing this operation.
+  final int? conflictServerVersion;
+
   const Operation({
     required this.operationId,
     required this.entityType,
@@ -73,7 +96,37 @@ class Operation {
     this.retryCount = 0,
     this.errorMessage,
     this.customOperationName,
+    this.baseVersion,
+    this.conflictData,
+    this.conflictServerVersion,
   });
+
+  /// Whether this operation is parked waiting on a conflict decision.
+  bool get isConflicted => status == OperationStatus.conflicted;
+
+  /// Re-queue this operation on top of [baseVersion], dropping the conflict.
+  ///
+  /// Rebasing is what makes "keep mine" terminal instead of circular: re-sending
+  /// the operation unchanged would hit the very same version check and conflict
+  /// again, forever.
+  Operation rebased({
+    required int? baseVersion,
+    Map<String, dynamic>? payload,
+  }) {
+    return Operation(
+      operationId: operationId,
+      entityType: entityType,
+      entityId: entityId,
+      operationType: operationType,
+      payload: payload ?? this.payload,
+      timestamp: timestamp,
+      status: OperationStatus.pending,
+      deviceId: deviceId,
+      retryCount: 0,
+      customOperationName: customOperationName,
+      baseVersion: baseVersion,
+    );
+  }
 
   /// Create a copy with modified fields
   Operation copyWith({
@@ -88,6 +141,9 @@ class Operation {
     int? retryCount,
     String? errorMessage,
     String? customOperationName,
+    int? baseVersion,
+    Map<String, dynamic>? conflictData,
+    int? conflictServerVersion,
   }) {
     return Operation(
       operationId: operationId ?? this.operationId,
@@ -101,6 +157,9 @@ class Operation {
       retryCount: retryCount ?? this.retryCount,
       errorMessage: errorMessage ?? this.errorMessage,
       customOperationName: customOperationName ?? this.customOperationName,
+      baseVersion: baseVersion ?? this.baseVersion,
+      conflictData: conflictData ?? this.conflictData,
+      conflictServerVersion: conflictServerVersion ?? this.conflictServerVersion,
     );
   }
 
@@ -118,6 +177,9 @@ class Operation {
       'retryCount': retryCount,
       'errorMessage': errorMessage,
       'customOperationName': customOperationName,
+      'baseVersion': baseVersion,
+      'conflictData': conflictData,
+      'conflictServerVersion': conflictServerVersion,
     };
   }
 
@@ -139,6 +201,11 @@ class Operation {
       retryCount: map['retryCount'] as int? ?? 0,
       errorMessage: map['errorMessage'] as String?,
       customOperationName: map['customOperationName'] as String?,
+      baseVersion: map['baseVersion'] as int?,
+      conflictData: map['conflictData'] == null
+          ? null
+          : Map<String, dynamic>.from(map['conflictData'] as Map),
+      conflictServerVersion: map['conflictServerVersion'] as int?,
     );
   }
 

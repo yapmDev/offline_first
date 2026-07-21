@@ -54,6 +54,7 @@ class SyncResult {
     this.isRetryable = true,
     this.conflictData,
     this.resolvedPayload,
+    this.serverVersion,
   });
 
   /// Create a successful result
@@ -82,11 +83,27 @@ class SyncResult {
     );
   }
 
+  /// Entity version the server reported when refusing a conflicting write.
+  ///
+  /// Resolving "keep mine" rebases the operation onto this version. Without
+  /// it the retry carries the same stale version and conflicts again — so an
+  /// adapter that omits it makes the conflict unresolvable.
+  final int? serverVersion;
+
   /// Create a conflict result
-  factory SyncResult.conflict({required Map<String, dynamic> conflictData}) {
+  ///
+  /// [conflictData] is the server's current state of the entity, used to show
+  /// what the local write lost against.
+  factory SyncResult.conflict({
+    required Map<String, dynamic> conflictData,
+    int? serverVersion,
+    int? serverTimestamp,
+  }) {
     return SyncResult(
       success: false,
       conflictData: conflictData,
+      serverVersion: serverVersion,
+      serverTimestamp: serverTimestamp,
       isRetryable: false,
     );
   }

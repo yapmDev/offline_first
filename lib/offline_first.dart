@@ -19,6 +19,7 @@ export 'src/sync/sync_engine.dart';
 export 'src/sync/operation_reducer.dart';
 
 // Conflict Resolution
+export 'src/conflict/sync_conflict.dart';
 export 'src/conflict/conflict_resolver.dart';
 export 'src/conflict/last_write_wins_resolver.dart';
 export 'src/conflict/field_level_merge_resolver.dart';

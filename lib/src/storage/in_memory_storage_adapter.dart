@@ -103,6 +103,13 @@ class InMemoryStorageAdapter implements StorageAdapter {
   }
 
   @override
+  Future<List<Operation>> getOperationsByStatus(OperationStatus status) async {
+    _ensureInitialized();
+    return _operations.values.where((op) => op.status == status).toList()
+      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+  }
+
+  @override
   Future<List<Operation>> getOperationsForType(String entityType) async {
     _ensureInitialized();
     return _operations.values
