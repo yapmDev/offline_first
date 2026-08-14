@@ -298,17 +298,25 @@ class SyncEngine {
       final result = await adapter.syncOperation(operation);
 
       if (result.success) {
-        // Success - mark as synced and remove from log
-        await _operationLog.remove(operation.operationId);
-
-        // Update entity with server response if provided
+        // El servidor ya aplicó la escritura. Reconciliar la copia local es lo
+        // que queda, y su fallo no puede reencolar la operación: reenviarla
+        // volvería a aplicar en el servidor algo que ya está aplicado, y como
+        // la baja del log ocurre igual, el ciclo se repetiría en cada sync sin
+        // llegar nunca a agotarse. Una copia local desactualizada, en cambio,
+        // se corrige sola en la próxima lectura (son local-first con refresco).
         if (result.resolvedPayload != null) {
-          await _storage.saveEntity(
-            operation.entityType,
-            operation.entityId,
-            result.resolvedPayload!,
-          );
+          try {
+            await _storage.saveEntity(
+              operation.entityType,
+              operation.entityId,
+              result.resolvedPayload!,
+            );
+          } catch (e) {
+            _emitReconcileFailure(operation, e);
+          }
         }
+
+        await _operationLog.remove(operation.operationId);
 
         return _SyncOutcome.synced;
       } else if (result.conflictData != null || result.serverVersion != null) {
@@ -543,6 +551,23 @@ class SyncEngine {
         completedOperations: completed,
         reducedCount: reducedCount,
         currentOperation: currentOperation,
+      ),
+    );
+  }
+
+  /// Avisa que la copia local no pudo reconciliarse con la respuesta del
+  /// servidor, sin marcar el sync como fallido: la escritura remota sí se
+  /// aplicó. Va por el stream de estado —el único canal que expone el motor—
+  /// para que el fallo no quede mudo, que es lo que lo vuelve difícil de ver.
+  void _emitReconcileFailure(Operation operation, Object error) {
+    _statusController.add(
+      SyncStatusEvent(
+        status: SyncStatus.syncing,
+        phase: SyncPhase.syncing,
+        currentOperation: '${operation.operationType.name} ${operation.entityType}',
+        errorMessage:
+            'Synced, but saving the server response failed for '
+            '${operation.entityType}/${operation.entityId}: $error',
       ),
     );
   }
