@@ -248,7 +248,15 @@ class SyncEngine {
       final entityOps = entry.value;
       final reducedOps = _operationReducer.reduceMany(entityOps);
 
-      if (reducedOps.isNotEmpty) {
+      if (reducedOps.length == entityOps.length) {
+        // Nothing was reduced — every reduction drops at least one operation,
+        // so an unchanged count means the list came back untouched. Squashing
+        // here would rewrite the log with what it already holds, and a squash
+        // is a delete plus an insert: any per-row bookkeeping a StorageAdapter
+        // keeps (attempt counters, timestamps) is reset every single pass, so
+        // no attempt cap built on it can ever reach its limit.
+        reduced.addAll(entityOps);
+      } else if (reducedOps.isNotEmpty) {
         // Replace original operations with reduced ones
         await _operationLog.squash(entityOps, reducedOps.first);
 
@@ -505,23 +513,34 @@ class SyncEngine {
   }
 
   /// Handle exception during sync
+  ///
+  /// An adapter that throws instead of returning a [SyncResult] broke the
+  /// contract, and with it the only source of truth about whether the failure
+  /// is worth retrying — the adapter is the one that knows. Treating the
+  /// unknown as retryable forever is the worst option available: the queue
+  /// never drains, and everything gated on "nothing pending" (logging out,
+  /// switching tenants) stays blocked. So it is retried like any transient
+  /// failure, and once the attempts are spent it is parked as permanent and
+  /// surfaced through [OfflineStore.getFailedOperations] for a person to
+  /// retry or discard.
   Future<_SyncOutcome> _handleException(Operation operation, Object error) async {
     if (operation.retryCount >= _config.maxRetries) {
       await _operationLog.update(
         operation.copyWith(
-          status: OperationStatus.failed,
+          status: OperationStatus.failedPermanent,
           errorMessage: error.toString(),
         ),
       );
-    } else {
-      await _operationLog.update(
-        operation.copyWith(
-          status: OperationStatus.pending,
-          retryCount: operation.retryCount + 1,
-          errorMessage: error.toString(),
-        ),
-      );
+      return _SyncOutcome.stalled;
     }
+
+    await _operationLog.update(
+      operation.copyWith(
+        status: OperationStatus.pending,
+        retryCount: operation.retryCount + 1,
+        errorMessage: error.toString(),
+      ),
+    );
     return _SyncOutcome.retryable;
   }
 

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — a queue that never drains
+
+- **Reduction no longer rewrites the log when there is nothing to reduce.**
+  Every pass squashed each entity's operations even when the reducer handed
+  them back untouched, and a squash is a delete plus an insert. Any per-row
+  bookkeeping a `StorageAdapter` keeps — an attempt counter being the obvious
+  one — was wiped on every sync, so a cap built on it could never reach its
+  limit and a failing write stayed pending forever, blocking everything gated
+  on an empty queue.
+- **An adapter that throws no longer retries forever.** Escaping with an
+  exception instead of returning a `SyncResult` skips the only judgement about
+  whether the failure is worth retrying, and the engine assumed it always was.
+  It is now retried up to `maxRetries` and then parked as `failedPermanent`,
+  where `getFailedOperations()` surfaces it for a person to retry or discard.
+
 ### Added — conflict detection and resolution
 
 - **`Operation.baseVersion`**: the entity version a write was made on top of,
